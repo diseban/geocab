@@ -37,10 +37,7 @@ pub struct DriverLocation {
 #[external]
 impl Geocab {
     /// Publish driver locations
-    pub fn publish_driver_locations(
-        &mut self,
-        drivers: Vec<(Address, i128, i128)>,
-    ) -> Result<(), Vec<u8>> {
+    pub fn publish_driver_locations(&mut self, drivers: Vec<(Address, i128, i128)>) {
         //self.number.set(drivers[0].1);
         for driver in drivers {
             let (address, lat_input, lon_input) = driver;
@@ -55,7 +52,6 @@ impl Geocab {
             driver.lat.set(lat_input.try_into().unwrap());
             driver.lon.set(lon_input.try_into().unwrap());
         }
-        Ok(())
     }
 
     /// Gets numbers at a geohash
