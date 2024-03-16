@@ -60,14 +60,18 @@ impl Geocab {
         }
     }
 
-    /// Gets numbers at a geohash
-    pub fn driver_at_geohash(&self, geohash: String) -> Result<Vec<Address>, Vec<u8>> {
-        let drivers = self.driver_at_geohash(geohash).unwrap();
-        Ok(drivers)
+    /// Gets drivers at a geohash
+    pub fn drivers_at_geohash(&self, geohash: String) -> Result<Vec<Address>, Vec<u8>> {
+        let mut result = Vec::new();
+        let drivers = self.drivers_on_grid.get(geohash);
+        for i in 0..drivers.len() {
+            result.push(drivers.get(i).unwrap().address.get())
+        }
+        Ok(result)
     }
 
     /// Books a trip
-    pub fn book_trip(&mut self, origin: (i128, i128), destination: (i128, i128)) {
+    pub fn book_trip(&mut self, origin: (i128, i128), _destination: (i128, i128)) {
         let origin_hash = encode_geohash(origin.0, origin.1);
         let nearby_drivers = self.drivers_on_grid.get(origin_hash);
         let driver_location = nearby_drivers.get(0).expect("No drivers");
