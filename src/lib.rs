@@ -1,28 +1,4 @@
-//!
-//! Stylus Hello World
-//!
-//! The following contract implements the Geocab example from Foundry.
-//!
-//! ```
-//! contract Geocab {
-//!     uint256 public number;
-//!     function setNumber(uint256 newNumber) public {
-//!         number = newNumber;
-//!     }
-//!     function increment() public {
-//!         number++;
-//!     }
-//! }
-//! ```
-//!
-//! The program is ABI-equivalent with Solidity, which means you can call it from both Solidity and Rust.
-//! To do this, run `cargo stylus export-abi`.
-//!
-//! Note: this code is a template-only and has not been audited.
-//!
-
-// Allow `cargo stylus export-abi` to generate a main function.
-#![no_std]
+#![cfg_attr(not(feature = "export-abi"), no_std)]
 #![cfg_attr(not(feature = "export-abi"), no_main)]
 extern crate alloc;
 
@@ -31,24 +7,16 @@ extern crate alloc;
 static ALLOC: mini_alloc::MiniAlloc = mini_alloc::MiniAlloc::INIT;
 
 use alloc::{string::String, vec::Vec};
+use alloy_sol_types::sol;
 /// Import items from the SDK. The prelude contains common traits and macros.
 use stylus_sdk::{
-    alloy_primitives::{Address, I128, U256},
-    contract::address,
+    alloy_primitives::{Address, U256},
+    evm,
     prelude::*,
     storage::{StorageAddress, StorageI128, StorageMap, StorageString, StorageU256, StorageVec},
 };
 use substrate_fixed::types::I64F64;
 use substrate_geohash::GeoHash;
-
-// Define some persistent storage using the Solidity ABI.
-// `Geocab` will be the entrypoint.
-// sol_storage! {
-//     #[entrypoint]
-//     pub struct Geocab {
-//         uint256 number;
-//     }
-// }
 
 #[entrypoint]
 #[solidity_storage]
@@ -76,9 +44,7 @@ impl Geocab {
         //self.number.set(drivers[0].1);
         for driver in drivers {
             let (address, lat_input, lon_input) = driver;
-            let lat = I64F64::from_num(lat_input);
-            let lon = I64F64::from_num(lon_input);
-            let hash: String = GeoHash::<9>::try_from_params(lat, lon).unwrap().into();
+            let hash = encode_geohash(lat_input, lon_input);
             // mapping driver address -> geohash
             let mut guard = self.driver_grid.setter(address);
             guard.set_str(&hash);
@@ -91,6 +57,29 @@ impl Geocab {
         }
         Ok(())
     }
+
+    /// Gets numbers at a geohash
+    pub fn driver_at_geohash(&self, geohash: String) -> Result<Vec<Address>, Vec<u8>> {
+        let drivers = self.driver_at_geohash(geohash).unwrap();
+        Ok(drivers)
+    }
+
+    /// Books a trip
+    pub fn book_trip(
+        &self,
+        origin: (i128, i128),
+        destination: (i128, i128),
+    ) -> Result<(), Vec<u8>> {
+        let origin_hash = encode_geohash(origin.0, origin.1);
+        let nearby_drivers = self.drivers_on_grid.get(origin_hash);
+        let driver_location = nearby_drivers.get(0).ok_or_else(Vec::new)?;
+        evm::log(TripBooked {
+            passenger: Address::ZERO,
+            driver: driver_location.address.get(),
+        });
+        Ok(())
+    }
+
     /// Gets the number from storage.
     pub fn number(&self) -> Result<U256, Vec<u8>> {
         Ok(U256::from(self.number.get()))
@@ -107,3 +96,22 @@ impl Geocab {
         self.set_number(number + U256::from(1));
     }
 }
+
+fn encode_geohash(lat: i128, lon: i128) -> String {
+    let lat = I64F64::from_num(lat);
+    let lon = I64F64::from_num(lon);
+    GeoHash::<9>::try_from_params(lat, lon).unwrap().into()
+}
+
+sol! {
+    event TripBooked(address indexed passenger, address indexed driver);
+}
+/*
+fn foo() {
+    evm::log(TripBooked {
+        passenger: Address::ZERO,
+        driver: address,
+        value,
+    });
+}
+*/

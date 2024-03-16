@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-alloy-primitives = "0.6.4"
-alloy-sol-types = "0.6.4"
+alloy-primitives = "0.3.3"
+alloy-sol-types = "0.3.1"
 stylus-sdk = "0.4.3"
 mini-alloc = "0.4.2"
 h3o = { version = "0.6.0", default-features = false }
