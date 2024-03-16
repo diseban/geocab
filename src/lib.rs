@@ -1,5 +1,5 @@
 #![cfg_attr(not(feature = "export-abi"), no_std)]
-#![cfg_attr(not(feature = "export-abi"), no_main)]
+#![cfg_attr(not(any(feature = "export-abi", test)), no_main)]
 extern crate alloc;
 
 /// Use an efficient WASM allocator.
@@ -8,10 +8,9 @@ static ALLOC: mini_alloc::MiniAlloc = mini_alloc::MiniAlloc::INIT;
 
 use alloc::{string::String, vec::Vec};
 use alloy_sol_types::sol;
-/// Import items from the SDK. The prelude contains common traits and macros.
 use stylus_sdk::{
     alloy_primitives::{Address, U256},
-    evm,
+    evm, msg,
     prelude::*,
     storage::{StorageAddress, StorageI128, StorageMap, StorageString, StorageU256, StorageVec},
 };
@@ -24,6 +23,7 @@ pub struct Geocab {
     number: StorageU256,
     drivers_on_grid: StorageMap<String, StorageVec<DriverLocation>>,
     driver_grid: StorageMap<Address, StorageString>,
+    active_trips: StorageVec<Trip>,
 }
 
 #[solidity_storage]
@@ -31,6 +31,12 @@ pub struct DriverLocation {
     pub address: StorageAddress,
     pub lat: StorageI128,
     pub lon: StorageI128,
+}
+
+#[solidity_storage]
+pub struct Trip {
+    pub passenger: StorageAddress,
+    pub driver: StorageAddress,
 }
 
 /// Declare that `Geocab` is a contract with the following external methods.
@@ -61,19 +67,25 @@ impl Geocab {
     }
 
     /// Books a trip
-    pub fn book_trip(
-        &self,
-        origin: (i128, i128),
-        destination: (i128, i128),
-    ) -> Result<(), Vec<u8>> {
+    pub fn book_trip(&mut self, origin: (i128, i128), destination: (i128, i128)) {
         let origin_hash = encode_geohash(origin.0, origin.1);
         let nearby_drivers = self.drivers_on_grid.get(origin_hash);
-        let driver_location = nearby_drivers.get(0).ok_or_else(Vec::new)?;
+        let driver_location = nearby_drivers.get(0).expect("No drivers");
+        let mut new_trip = self.active_trips.grow();
+        new_trip.driver.set(driver_location.address.get());
+        new_trip.passenger.set(msg::sender());
         evm::log(TripBooked {
-            passenger: Address::ZERO,
+            passenger: msg::sender(),
             driver: driver_location.address.get(),
         });
-        Ok(())
+    }
+
+    pub fn active_passengers(&self) -> Result<Vec<Address>, Vec<u8>> {
+        let mut result = Vec::new();
+        for i in 0..self.active_trips.len() {
+            result.push(self.active_trips.get(i).unwrap().passenger.get())
+        }
+        Ok(result)
     }
 
     /// Gets the number from storage.
@@ -94,20 +106,70 @@ impl Geocab {
 }
 
 fn encode_geohash(lat: i128, lon: i128) -> String {
-    let lat = I64F64::from_num(lat);
-    let lon = I64F64::from_num(lon);
+    let lat = I64F64::from_be_bytes(lat.to_be_bytes());
+    let lon = I64F64::from_be_bytes(lon.to_be_bytes());
     GeoHash::<9>::try_from_params(lat, lon).unwrap().into()
+}
+
+pub enum GeocabError {
+    InvalidGeohashLength(InvalidGeohashLength),
+    GenericError(GenericError),
 }
 
 sol! {
     event TripBooked(address indexed passenger, address indexed driver);
+
+    error InvalidTokenId(uint256 token_id);
+    error NotOwner(address from, uint256 token_id, address real_owner);
+    error NotApproved(uint256 token_id, address owner, address spender);
+    error TransferToZero(uint256 token_id);
+    error ReceiverRefused(address receiver, uint256 token_id, bytes4 returned);
+    error InvalidGeohashLength();
+    error GenericError();
 }
-/*
-fn foo() {
-    evm::log(TripBooked {
-        passenger: Address::ZERO,
-        driver: address,
-        value,
-    });
+
+#[cfg(test)]
+mod tests {
+    use core::str::FromStr;
+
+    use alloc::{string::String, vec::Vec};
+    use substrate_fixed::types::I64F64;
+    use substrate_geohash::GeoHash;
+
+    use crate::encode_geohash;
+
+    #[test]
+    fn test_geohash() {
+        let hash = encode_geohash(940783947759187132416, 0);
+        assert_eq!("gcpfpurbx", hash)
+    }
+
+    #[test]
+    fn test_geo_2() {
+        let lat = I64F64::from_str("51.0").unwrap();
+        let lon = I64F64::from_str("0.0").unwrap();
+        let geohash = GeoHash::<5>::try_from_params(lat, lon).unwrap();
+        let neighbors = geohash.neighbors().unwrap();
+        let geo_str = geohash.into();
+        let mut results = Vec::<String>::new();
+        results.push(geo_str);
+        results.push(neighbors.n.into());
+        results.push(neighbors.ne.into());
+        results.push(neighbors.e.into());
+        results.push(neighbors.se.into());
+        results.push(neighbors.s.into());
+        results.push(neighbors.sw.into());
+        results.push(neighbors.w.into());
+        results.push(neighbors.nw.into());
+        assert_eq!(
+            "gcpfp, gcpfr, u1042, u1040, u101b, gcpcz, gcpcy, gcpfn, gcpfq",
+            results.join(", ")
+        );
+    }
+
+    #[test]
+    fn test_num() {
+        let n = 51_i128 << 64;
+        assert_eq!(940783947759187132416, n)
+    }
 }
-*/
