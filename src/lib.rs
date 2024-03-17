@@ -78,7 +78,10 @@ impl Geocab {
             driver.lat.set(lat_input.try_into().unwrap());
             driver.lon.set(lon_input.try_into().unwrap());
         }
-        self.number.set(self.number.get() + U256::from(num_drivers))
+        self.number.set(self.number.get() + U256::from(num_drivers));
+        evm::log(DriversRegistered {
+            num_drivers: num_drivers as u32,
+        })
     }
 
     /// Gets drivers at a geohash
@@ -101,11 +104,12 @@ impl Geocab {
         let origin_location = Location::from_i128_tuple(origin);
         let destination_location = Location::from_i128_tuple(destination);
         let distance = destination_location.distance_indication(&origin_location);
-        let estimate = distance * to_fixed_signed(self.price_factor.get());
-        Ok(U256::from_be_bytes(estimate.to_be_bytes()))
+        let _estimate = distance * to_fixed_signed(self.price_factor.get());
+        Ok(U256::from(1))
     }
 
     /// Books a trip
+    #[payable]
     pub fn book_trip(&mut self, origin: (i128, i128), destination: (i128, i128)) {
         let passenger_address = msg::sender();
         let payment = msg::value();
@@ -135,6 +139,11 @@ impl Geocab {
         Ok(())
     }
 
+    pub fn compute_geohash(&self, location: (i128, i128)) -> Result<String, Vec<u8>> {
+        let hash = encode_geohash(&Location::from_i128_tuple(location));
+        Ok(hash.into())
+    }
+
     pub fn set_fee(&mut self, new_per_trip_fee: U256) {
         if msg::sender() != OWNER {
             panic!("Not owner")
@@ -158,17 +167,6 @@ impl Geocab {
     /// Gets the number from storage.
     pub fn number(&self) -> Result<U256, Vec<u8>> {
         Ok(U256::from(self.number.get()))
-    }
-
-    /// Sets a number in storage to a user-specified value.
-    pub fn set_number(&mut self, new_number: U256) {
-        self.number.set(new_number);
-    }
-
-    /// Increments `number` and updates its value in storage.
-    pub fn increment(&mut self) {
-        let number = self.number.get();
-        self.set_number(number + U256::from(1));
     }
 }
 
@@ -276,6 +274,7 @@ pub enum GeocabError {
 
 sol! {
     event TripBooked(address indexed passenger, address indexed driver, int128 dest_lat, int128 dest_lon);
+    event DriversRegistered(uint32 num_drivers);
 
     error InvalidTokenId(uint256 token_id);
     error NotOwner(address from, uint256 token_id, address real_owner);
@@ -284,6 +283,7 @@ sol! {
     error ReceiverRefused(address receiver, uint256 token_id, bytes4 returned);
     error InvalidGeohashLength();
     error GenericError();
+    error NoDriversAvailable();
 }
 
 #[cfg(test)]
