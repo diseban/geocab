@@ -6,11 +6,19 @@ extern crate alloc;
 #[global_allocator]
 static ALLOC: mini_alloc::MiniAlloc = mini_alloc::MiniAlloc::INIT;
 
+const OWNER: Address = Address::new([
+    0x80, 0x31, 0x0f, 0xA9, 0xcE, 0x4C, 0x31, 0x80, 0x38, 0x12, 0x1C, 0x10, 0x71, 0x62, 0xb8, 0x8F,
+    0x1E, 0xC1, 0x4A, 0xF6,
+]);
+
+use core::ops::Deref;
+
 use alloc::{string::String, vec::Vec};
 use alloy_primitives::Signed;
 use alloy_sol_types::sol;
 use stylus_sdk::{
     alloy_primitives::{Address, U256},
+    call::transfer_eth,
     evm, msg,
     prelude::*,
     storage::{StorageAddress, StorageI128, StorageMap, StorageString, StorageU256, StorageVec},
@@ -22,19 +30,20 @@ use substrate_geohash::GeoHash;
 #[solidity_storage]
 pub struct Geocab {
     number: StorageU256,
-    drivers_on_grid: StorageMap<String, StorageVec<DriverLocation>>,
+    drivers_on_grid: StorageMap<String, StorageVec<DriverLocationStorage>>,
     driver_grid: StorageMap<Address, StorageString>,
-    active_trips: StorageVec<Trip>,
+    active_trips: StorageMap<Address, Trip>,
+    per_trip_fee: StorageU256,
 }
 
 #[solidity_storage]
-pub struct DriverLocation {
+pub struct DriverLocationStorage {
     pub address: StorageAddress,
     pub lat: StorageI128,
     pub lon: StorageI128,
 }
 
-impl DriverLocation {
+impl DriverLocationStorage {
     fn location(&self) -> Location {
         let lat = to_fixed_signed(self.lat.get());
         let lon = to_fixed_signed(self.lon.get());
@@ -43,20 +52,21 @@ impl DriverLocation {
 }
 
 #[solidity_storage]
+#[derive(Erase)]
 pub struct Trip {
     pub passenger: StorageAddress,
     pub driver: StorageAddress,
+    pub value: StorageU256,
 }
 
-/// Declare that `Geocab` is a contract with the following external methods.
 #[external]
 impl Geocab {
     /// Publish driver locations
     pub fn publish_driver_locations(&mut self, drivers: Vec<(Address, i128, i128)>) {
-        //self.number.set(drivers[0].1);
+        let num_drivers = drivers.len();
         for driver in drivers {
             let (address, lat_input, lon_input) = driver;
-            let hash = encode_geohash(lat_input, lon_input);
+            let hash = encode_geohash(&Location::from_i128_tuple((lat_input, lon_input))).into();
             // mapping driver address -> geohash
             let mut guard = self.driver_grid.setter(address);
             guard.set_str(&hash);
@@ -67,6 +77,7 @@ impl Geocab {
             driver.lat.set(lat_input.try_into().unwrap());
             driver.lon.set(lon_input.try_into().unwrap());
         }
+        self.number.set(self.number.get() + U256::from(num_drivers))
     }
 
     /// Gets drivers at a geohash
@@ -81,31 +92,44 @@ impl Geocab {
 
     /// Books a trip
     pub fn book_trip(&mut self, origin: (i128, i128), destination: (i128, i128)) {
-        let origin_hash = encode_geohash(origin.0, origin.1);
-        let passenger_location = Location::from_i128_tuple(origin);
-        let nearby_drivers = self.drivers_on_grid.get(origin_hash);
-        let driver_locations = get_locations(&nearby_drivers);
-        let closest_driver_index = closest_index(&driver_locations, passenger_location);
-        let driver_location = nearby_drivers
-            .get(closest_driver_index)
-            .expect("No drivers");
-        let mut new_trip = self.active_trips.grow();
-        new_trip.driver.set(driver_location.address.get());
-        new_trip.passenger.set(msg::sender());
+        let passenger_address = msg::sender();
+        let payment = msg::value();
+        let origin_location = Location::from_i128_tuple(origin);
+        let nearby_drivers = self.all_nearby_drivers(&origin_location);
+        let closest_driver = closest_driver(&nearby_drivers, &origin_location);
+        let mut new_trip = self.active_trips.setter(passenger_address);
+        new_trip.driver.set(closest_driver.address);
+        new_trip.passenger.set(passenger_address);
+        new_trip.value.set(payment);
         evm::log(TripBooked {
-            passenger: msg::sender(),
-            driver: driver_location.address.get(),
+            passenger: passenger_address,
+            driver: closest_driver.address,
             dest_lat: destination.0,
             dest_lon: destination.1,
         });
     }
 
-    pub fn active_passengers(&self) -> Result<Vec<Address>, Vec<u8>> {
-        let mut result = Vec::new();
-        for i in 0..self.active_trips.len() {
-            result.push(self.active_trips.get(i).unwrap().passenger.get())
+    pub fn complete_trip(&mut self, success: bool) -> Result<(), Vec<u8>> {
+        let trip = self.active_trips.get(msg::sender());
+        if success {
+            let trip_value = trip.value.get();
+            let driver_payment = trip_value - self.per_trip_fee.get();
+            transfer_eth(trip.driver.get(), driver_payment)?;
+            transfer_eth(OWNER, self.per_trip_fee.get())?;
         }
-        Ok(result)
+        Ok(())
+    }
+
+    pub fn set_fee(&mut self, new_per_trip_fee: U256) {
+        if msg::sender() != OWNER {
+            panic!("Not owner")
+        }
+        self.per_trip_fee.set(new_per_trip_fee);
+    }
+
+    pub fn active_trip_driver(&self) -> Result<Address, Vec<u8>> {
+        let result = self.active_trips.get(msg::sender());
+        Ok(result.driver.get())
     }
 
     /// Gets the number from storage.
@@ -125,29 +149,58 @@ impl Geocab {
     }
 }
 
-fn get_locations(drivers: &StorageVec<DriverLocation>) -> Vec<Location> {
+impl Geocab {
+    fn all_nearby_drivers(&self, location: &Location) -> Vec<Driver> {
+        let position_hash = encode_geohash(location);
+        let mut all_position_hashes = all_neighbors(&position_hash);
+        let mut result = Vec::new();
+        all_position_hashes.push(position_hash);
+        for position_hash in all_position_hashes {
+            let nearby_drivers = self.drivers_on_grid.get(position_hash.into());
+            let mut driver_locations = get_locations(&nearby_drivers);
+            result.append(&mut driver_locations);
+        }
+        result
+    }
+}
+
+fn get_locations(stored_drivers: &StorageVec<DriverLocationStorage>) -> Vec<Driver> {
     let mut result = Vec::new();
-    for i in 0..drivers.len() {
-        result.push(drivers.get(i).unwrap().location())
+    for i in 0..stored_drivers.len() {
+        result.push(stored_drivers.get(i).unwrap().deref().into())
     }
     result
 }
 
-fn closest_index(locations: &[Location], passanger: Location) -> usize {
+fn closest_driver<'a>(drivers: &'a [Driver], passanger: &Location) -> &'a Driver {
     let mut min = I64F64::max_value();
-    let mut result = 0;
-    for (index, location) in locations.iter().enumerate() {
-        let distance = location.distance_indication(&passanger);
+    let mut result = None;
+    for driver in drivers {
+        let distance = driver.location.distance_indication(&passanger);
         if distance < min {
             min = distance;
-            result = index
+            result = Some(driver)
         }
     }
-    return result;
+    return result.unwrap();
+}
+
+struct Driver {
+    address: Address,
+    location: Location,
 }
 struct Location {
     pub lat: I64F64,
     pub lon: I64F64,
+}
+
+impl From<&DriverLocationStorage> for Driver {
+    fn from(value: &DriverLocationStorage) -> Self {
+        Driver {
+            address: value.address.get(),
+            location: value.location(),
+        }
+    }
 }
 
 impl Location {
@@ -175,10 +228,8 @@ fn to_fixed_signed(x: Signed<128, 2>) -> I64F64 {
     I64F64::from_be_bytes(x.to_be_bytes())
 }
 
-fn encode_geohash(lat: i128, lon: i128) -> String {
-    let lat = to_fixed(lat);
-    let lon = to_fixed(lon);
-    GeoHash::<9>::try_from_params(lat, lon).unwrap().into()
+fn encode_geohash(location: &Location) -> GeoHash<5> {
+    GeoHash::<5>::try_from_params(location.lat, location.lon).unwrap()
 }
 
 fn all_neighbors(center: &GeoHash<5>) -> Vec<GeoHash<5>> {
@@ -220,12 +271,13 @@ mod tests {
     use substrate_fixed::types::I64F64;
     use substrate_geohash::GeoHash;
 
-    use crate::encode_geohash;
+    use super::{encode_geohash, Location};
 
     #[test]
     fn test_geohash() {
-        let hash = encode_geohash(940783947759187132416, 0);
-        assert_eq!("gcpfpurbx", hash)
+        let hash: String =
+            encode_geohash(&Location::from_i128_tuple((940783947759187132416, 0))).into();
+        assert_eq!("gcpfp", hash)
     }
 
     #[test]
