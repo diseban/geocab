@@ -14,7 +14,7 @@ const OWNER: Address = Address::new([
 use core::ops::Deref;
 
 use alloc::{string::String, vec::Vec};
-use alloy_primitives::Signed;
+use alloy_primitives::{Signed, I128};
 use alloy_sol_types::sol;
 use stylus_sdk::{
     alloy_primitives::{Address, U256},
@@ -34,6 +34,7 @@ pub struct Geocab {
     driver_grid: StorageMap<Address, StorageString>,
     active_trips: StorageMap<Address, Trip>,
     per_trip_fee: StorageU256,
+    price_factor: StorageI128,
 }
 
 #[solidity_storage]
@@ -90,6 +91,20 @@ impl Geocab {
         Ok(result)
     }
 
+    /// Estimate a trip
+    ///
+    pub fn estimate_trip(
+        &self,
+        origin: (i128, i128),
+        destination: (i128, i128),
+    ) -> Result<U256, Vec<u8>> {
+        let origin_location = Location::from_i128_tuple(origin);
+        let destination_location = Location::from_i128_tuple(destination);
+        let distance = destination_location.distance_indication(&origin_location);
+        let estimate = distance * to_fixed_signed(self.price_factor.get());
+        Ok(U256::from_be_bytes(estimate.to_be_bytes()))
+    }
+
     /// Books a trip
     pub fn book_trip(&mut self, origin: (i128, i128), destination: (i128, i128)) {
         let passenger_address = msg::sender();
@@ -125,6 +140,14 @@ impl Geocab {
             panic!("Not owner")
         }
         self.per_trip_fee.set(new_per_trip_fee);
+    }
+
+    pub fn set_price_factor(&mut self, new_price_factor: i128) {
+        if msg::sender() != OWNER {
+            panic!("Not owner")
+        }
+        self.price_factor
+            .set(I128::from_be_bytes(new_price_factor.to_be_bytes()));
     }
 
     pub fn active_trip_driver(&self) -> Result<Address, Vec<u8>> {
