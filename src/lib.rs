@@ -7,6 +7,7 @@ extern crate alloc;
 static ALLOC: mini_alloc::MiniAlloc = mini_alloc::MiniAlloc::INIT;
 
 use alloc::{string::String, vec::Vec};
+use alloy_primitives::Signed;
 use alloy_sol_types::sol;
 use stylus_sdk::{
     alloy_primitives::{Address, U256},
@@ -31,6 +32,14 @@ pub struct DriverLocation {
     pub address: StorageAddress,
     pub lat: StorageI128,
     pub lon: StorageI128,
+}
+
+impl DriverLocation {
+    fn location(&self) -> Location {
+        let lat = to_fixed_signed(self.lat.get());
+        let lon = to_fixed_signed(self.lon.get());
+        Location { lat, lon }
+    }
 }
 
 #[solidity_storage]
@@ -71,16 +80,23 @@ impl Geocab {
     }
 
     /// Books a trip
-    pub fn book_trip(&mut self, origin: (i128, i128), _destination: (i128, i128)) {
+    pub fn book_trip(&mut self, origin: (i128, i128), destination: (i128, i128)) {
         let origin_hash = encode_geohash(origin.0, origin.1);
+        let passenger_location = Location::from_i128_tuple(origin);
         let nearby_drivers = self.drivers_on_grid.get(origin_hash);
-        let driver_location = nearby_drivers.get(0).expect("No drivers");
+        let driver_locations = get_locations(&nearby_drivers);
+        let closest_driver_index = closest_index(&driver_locations, passenger_location);
+        let driver_location = nearby_drivers
+            .get(closest_driver_index)
+            .expect("No drivers");
         let mut new_trip = self.active_trips.grow();
         new_trip.driver.set(driver_location.address.get());
         new_trip.passenger.set(msg::sender());
         evm::log(TripBooked {
             passenger: msg::sender(),
             driver: driver_location.address.get(),
+            dest_lat: destination.0,
+            dest_lon: destination.1,
         });
     }
 
@@ -109,10 +125,74 @@ impl Geocab {
     }
 }
 
+fn get_locations(drivers: &StorageVec<DriverLocation>) -> Vec<Location> {
+    let mut result = Vec::new();
+    for i in 0..drivers.len() {
+        result.push(drivers.get(i).unwrap().location())
+    }
+    result
+}
+
+fn closest_index(locations: &[Location], passanger: Location) -> usize {
+    let mut min = I64F64::max_value();
+    let mut result = 0;
+    for (index, location) in locations.iter().enumerate() {
+        let distance = location.distance_indication(&passanger);
+        if distance < min {
+            min = distance;
+            result = index
+        }
+    }
+    return result;
+}
+struct Location {
+    pub lat: I64F64,
+    pub lon: I64F64,
+}
+
+impl Location {
+    pub fn from_i128_tuple(t: (i128, i128)) -> Self {
+        Location {
+            lat: to_fixed(t.0),
+            lon: to_fixed(t.1),
+        }
+    }
+
+    pub fn distance_indication(&self, other: &Location) -> I64F64 {
+        let lat_diff = self.lat - other.lat;
+        let lon_diff = self.lon - other.lon;
+        lat_diff.abs() + lon_diff.abs()
+    }
+}
+
+#[inline]
+fn to_fixed(x: i128) -> I64F64 {
+    I64F64::from_be_bytes(x.to_be_bytes())
+}
+
+#[inline]
+fn to_fixed_signed(x: Signed<128, 2>) -> I64F64 {
+    I64F64::from_be_bytes(x.to_be_bytes())
+}
+
 fn encode_geohash(lat: i128, lon: i128) -> String {
-    let lat = I64F64::from_be_bytes(lat.to_be_bytes());
-    let lon = I64F64::from_be_bytes(lon.to_be_bytes());
+    let lat = to_fixed(lat);
+    let lon = to_fixed(lon);
     GeoHash::<9>::try_from_params(lat, lon).unwrap().into()
+}
+
+fn all_neighbors(center: &GeoHash<5>) -> Vec<GeoHash<5>> {
+    let mut result = Vec::new();
+    let neighbors = center.neighbors().expect("Invalid hash");
+    result.push(neighbors.n);
+    result.push(neighbors.ne);
+    result.push(neighbors.e);
+    result.push(neighbors.se);
+    result.push(neighbors.s);
+    result.push(neighbors.sw);
+    result.push(neighbors.w);
+    result.push(neighbors.nw);
+    result
 }
 
 pub enum GeocabError {
@@ -121,7 +201,7 @@ pub enum GeocabError {
 }
 
 sol! {
-    event TripBooked(address indexed passenger, address indexed driver);
+    event TripBooked(address indexed passenger, address indexed driver, int128 dest_lat, int128 dest_lon);
 
     error InvalidTokenId(uint256 token_id);
     error NotOwner(address from, uint256 token_id, address real_owner);
